@@ -24,6 +24,10 @@ type Client struct {
 	httpClient     httpclient.HTTPClient
 	cleanClient    httpclient.HTTPClient // 无 auth header 的干净 client,用于外部 CDN
 	profileHeaders fhttp.Header          // chrome profile 头 (UA / sec-ch-ua / accept-encoding)
+	extraHeaders   fhttp.Header          // 用户提供的反爬 header (oai-hlib / oai-sc / oai-gn)
+	isFree         bool                  // free 账号:oai-device-id 替代 Authorization
+	puid           string                // _puid cookie 值 (Team 账号)
+	teamAccountID  string                // Chatgpt-Account-Id header 值 (Team 账号)
 	bearerToken    string
 	cookieStr      string
 	userAgent      string
@@ -53,14 +57,14 @@ type Client struct {
 }
 
 // NewClient 创建新的 ChatGPT 客户端。
-// 默认使用 chrome V148 / MacOS 指纹 profile。
+// 默认使用 chrome V148 / Windows 指纹 profile(对齐 client-go req/v3 ImpersonateChrome)。
+// HTTP header 用 Edge UA — Chromium-based 浏览器 OpenAI 接受这种组合。
 func NewClient(cfg Config) *Client {
-	hc, err := chrome.NewClient(chrome.V148, chrome.MacOS)
+	hc, err := chrome.NewClient(chrome.V148, chrome.Windows)
 	if err != nil {
-		// 指纹 client 创建失败时回退到一个空 client,日志告警。
 		log.Printf("[web2api] chrome NewClient failed: %v", err)
 	}
-	clean, _ := chrome.NewClient(chrome.V148, chrome.MacOS)
+	clean, _ := chrome.NewClient(chrome.V148, chrome.Windows)
 
 	// profile header 表(在每次请求前会"追加"到 req.Header,作为基础)
 	ph := buildProfileHeaders()
@@ -69,6 +73,10 @@ func NewClient(cfg Config) *Client {
 		httpClient:      hc,
 		cleanClient:     clean,
 		profileHeaders:  ph,
+		extraHeaders:    fhttp.Header{},
+		isFree:          cfg.IsFree,
+		puid:            cfg.PUID,
+		teamAccountID:   cfg.TeamAccountID,
 		bearerToken:     cfg.BearerToken,
 		cookieStr:       cfg.CookieString,
 		userAgent:       orDefault(cfg.UserAgent, defaultUA),
@@ -85,27 +93,44 @@ func NewClient(cfg Config) *Client {
 		Logf:            log.Printf,
 	}
 
+	log.Printf("[web2api] [debug] NewClient profileHeaders key count: %d", len(c.profileHeaders))
+	for k, v := range c.profileHeaders {
+		log.Printf("[web2api] [debug] profileHeader[%q] = %v", k, v)
+	}
+
+	// 注入 ExtraHeaders
+	for k, v := range cfg.ExtraHeaders {
+		c.extraHeaders.Set(k, v)
+	}
+
 	// 注入 profile header 到 internal/files 包 (它没有 *Client 引用)。
-	files.SetDefaultProfileHeader(ph)
+	files.SetDefaultProfileHeader(c.fullProfileHeaders())
+	files.SetDefaultCommonHeader(c.commonHeaders())
 
 	return c
 }
 
-// buildProfileHeaders 返回与 chrome V148 / MacOS 匹配的 header 表。
-// 必须在每次请求前应用,确保 User-Agent / sec-ch-ua / accept-encoding 与
-// TLS 指纹一致(否则 Cloudflare 拦截返回 403)。
+// buildProfileHeaders 返回与 chrome V148 / Windows + Edge UA 匹配的 header 表(对齐 client-go)。
+// TLS 指纹是 Chrome (req/v3 ImpersonateChrome),UA 写 Edge — OpenAI 接受这种组合。
 func buildProfileHeaders() fhttp.Header {
 	return fhttp.Header{
-		"User-Agent":      {"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"},
-		"sec-ch-ua":       {`"Chromium";v="148", "Google Chrome";v="148", "Not/A)Brand";v="99"`},
-		"sec-ch-ua-mobile": {"?0"},
-		"sec-ch-ua-platform": {`"macOS"`},
-		"accept":          {"application/json, text/plain, */*"},
-		"accept-encoding": {"gzip, deflate, br, zstd"},
-		"accept-language": {"en-US,en;q=0.9"},
-		"sec-fetch-dest":  {"empty"},
-		"sec-fetch-mode":  {"cors"},
-		"sec-fetch-site":  {"same-origin"},
+		"User-Agent":                  {"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36 Edg/147.0.0.0"},
+		"sec-ch-ua":                   {`"Not)A;Brand";v="8", "Chromium";v="148", "Microsoft Edge";v="148"`},
+		"sec-ch-ua-mobile":            {"?0"},
+		"sec-ch-ua-platform":          {`"Windows"`},
+		"sec-ch-ua-arch":              {`"x86"`},
+		"sec-ch-ua-bitness":           {`"64"`},
+		"sec-ch-ua-full-version":      {`"148.0.2959.54"`},
+		"sec-ch-ua-full-version-list": {`"Not)A;Brand";v="8.0.0.0", "Chromium";v="148.0.2959.54", "Microsoft Edge";v="148.0.2959.54"`},
+		"sec-ch-ua-model":             {`""`},
+		"sec-ch-ua-platform-version":  {`"19.0.0"`},
+		"accept":                      {"*/*"},
+		"accept-encoding":             {"gzip, deflate, br, zstd"},
+		"accept-language":             {"zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6"},
+		"sec-fetch-dest":              {"empty"},
+		"sec-fetch-mode":              {"cors"},
+		"sec-fetch-site":              {"same-origin"},
+		"priority":                    {"u=1, i"},
 	}
 }
 
@@ -172,13 +197,12 @@ func (c *Client) logf(format string, args ...interface{}) {
 	}
 }
 
-// commonHeaders 返回 OpenAI / Sentinel 业务 header。
+// commonHeaders 返回 OpenAI / Sentinel 业务 header + 用户提供的反爬 header (ExtraHeaders)。
 // profile (UA / sec-ch-ua / accept-encoding 等) 不在这里,由调用方单独传 base 给 httpclient。
 // 内部子包 (auth / files) 通过 ClientParams.ProfileHeader 或 files.DefaultProfileHeader
 // 拿到 profile header,无需走 commonHeaders。
 func (c *Client) commonHeaders() fhttp.Header {
 	h := fhttp.Header{
-		"Authorization":           {"Bearer " + c.bearerToken},
 		"oai-language":            {c.language},
 		"oai-device-id":           {c.deviceID},
 		"oai-session-id":          {c.sessionID},
@@ -187,8 +211,50 @@ func (c *Client) commonHeaders() fhttp.Header {
 		"Origin":                  {"https://chatgpt.com"},
 		"Referer":                 {"https://chatgpt.com/"},
 	}
-	if c.cookieStr != "" {
-		h.Set("Cookie", c.cookieStr)
+	// Authorization: free 账号不设 (用 oai-device-id 替代);非 free 设 Bearer token
+	if !c.isFree {
+		h.Set("Authorization", "Bearer "+c.bearerToken)
+	} else {
+		// free 账号:把 token 放到 oai-device-id
+		h.Set("oai-device-id", c.bearerToken)
+	}
+	// Team 账号
+	if c.teamAccountID != "" {
+		h.Set("Chatgpt-Account-Id", c.teamAccountID)
+	}
+	// 注入用户提供的反爬 header (oai-hlib / oai-sc / oai-gn / priority 等)
+	for k, vs := range c.extraHeaders {
+		for _, v := range vs {
+			h.Set(k, v)
+		}
+	}
+	// Cookie: 用户 cookie + _puid (Team 账号)
+	cookieStr := c.cookieStr
+	if c.puid != "" {
+		if cookieStr != "" {
+			cookieStr = "_puid=" + c.puid + "; " + cookieStr
+		} else {
+			cookieStr = "_puid=" + c.puid + ";"
+		}
+	}
+	if cookieStr != "" {
+		h.Set("Cookie", cookieStr)
+	}
+	return h
+}
+
+// fullProfileHeaders 把 profile + extraHeaders 合并,作为 base 给 httpclient。
+func (c *Client) fullProfileHeaders() fhttp.Header {
+	h := fhttp.Header{}
+	for k, vs := range c.profileHeaders {
+		for _, v := range vs {
+			h.Add(k, v)
+		}
+	}
+	for k, vs := range c.extraHeaders {
+		for _, v := range vs {
+			h.Set(k, v)
+		}
 	}
 	return h
 }

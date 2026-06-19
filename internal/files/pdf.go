@@ -25,11 +25,11 @@ func ResolvePDFDownloadURL(ctx context.Context, httpClient httpclient.HTTPClient
 	}
 	status, respBody, _, err := httpclient.DoJSONCtx(ctx, httpClient, fhttp.MethodPost, apiPath,
 		DefaultProfileHeader,
-		fhttp.Header{
+		mergeFilesHeaders(DefaultCommonHeader, fhttp.Header{
 			"Content-Type":          {"application/json"},
 			"x-openai-target-path":  {apiPath},
 			"x-openai-target-route": {"/backend-api/conversation/{conversation_id}/interpreter/download"},
-		},
+		}),
 		body,
 	)
 	if err != nil {
@@ -70,7 +70,7 @@ func ProxyPDFBySandboxPath(
 
 	resp, err := httpclient.DoRaw(ctx, cleanClient, fhttp.MethodGet, downloadURL,
 		DefaultProfileHeader,
-		fhttp.Header{"User-Agent": {ua}},
+		mergeFilesHeaders(DefaultCommonHeader, fhttp.Header{"User-Agent": {ua}}),
 		nil,
 	)
 	if err != nil {
@@ -109,7 +109,7 @@ func DownloadSandboxFile(ctx context.Context, httpClient, cleanClient httpclient
 	}
 	resp, err := httpclient.DoRaw(ctx, cleanClient, fhttp.MethodGet, downloadURL,
 		DefaultProfileHeader,
-		fhttp.Header{"User-Agent": {ua}},
+		mergeFilesHeaders(DefaultCommonHeader, fhttp.Header{"User-Agent": {ua}}),
 		nil,
 	)
 	if err != nil {

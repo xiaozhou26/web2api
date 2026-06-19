@@ -11,6 +11,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 
 	"github.com/andybalholm/brotli"
@@ -54,6 +55,25 @@ func NewRequest(ctx context.Context, method, url string, base, headers fhttp.Hea
 				req.Header.Set(k, v)
 			}
 		}
+	}
+	// Debug: dump Authorization + UA + sec-ch-ua presence
+	if req.Header.Get("Authorization") == "" {
+		fmt.Fprintf(os.Stderr, "[web2api] [debug] %s %s 缺 Authorization header\n", method, url)
+		fmt.Fprintf(os.Stderr, "[web2api] [debug] base keys: %d, headers keys: %d\n", len(base), len(headers))
+		if headers != nil {
+			for k, v := range headers {
+				fmt.Fprintf(os.Stderr, "[web2api] [debug]   headers[%q] = %v\n", k, v)
+			}
+		}
+	} else {
+		auth := req.Header.Get("Authorization")
+		if len(auth) > 30 {
+			auth = auth[:30] + "..."
+		}
+		fmt.Fprintf(os.Stderr, "[web2api] [debug] %s %s Authorization: %s, UA: %s, sec-ch-ua: %s\n",
+			method, url, auth,
+			req.Header.Get("User-Agent"),
+			req.Header.Get("sec-ch-ua"))
 	}
 	return req, nil
 }

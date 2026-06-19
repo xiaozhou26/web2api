@@ -26,8 +26,14 @@ func main() {
 
 	// 2. 初始化 Token 池
 	pool := NewTokenPool(cfg.TokensFile, time.Duration(cfg.TokenRefreshAheadSec)*time.Second)
-	total, valid, _ := pool.Stats()
-	log.Printf("[startup] Token pool: total=%d, valid=%d", total, valid)
+	total, valid, errored, expired := pool.StatsEx()
+	log.Printf("[startup] Token pool: total=%d, valid=%d, errored=%d, expired=%d", total, valid, errored, expired)
+	if expired > 0 {
+		log.Printf("[startup] ⚠️  %d 个 token 已过期 (有 ST 的会尝试自动刷新,纯 AT 的需重新登录 chatgpt.com 取新 token)", expired)
+	}
+	if valid == 0 && total > 0 {
+		log.Printf("[startup] ⚠️  没有可用的 token — 重新登录 chatgpt.com 拿新 accessToken 后通过 /tokens/upload 注入")
+	}
 
 	// 3. 初始化 Session 管理器
 	session := NewSessionManager(&cfg)

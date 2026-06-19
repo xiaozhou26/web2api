@@ -270,6 +270,26 @@ func (tp *TokenPool) Stats() (total, valid, errored int) {
 	return
 }
 
+// StatsEx 返回 total/valid/errored/expired。
+// expired = AccessToken 非空但 ExpiresAt 已过期的条目。
+func (tp *TokenPool) StatsEx() (total, valid, errored, expired int) {
+	tp.mu.Lock()
+	defer tp.mu.Unlock()
+	total = len(tp.entries)
+	errored = len(tp.errorKeys)
+	now := time.Now()
+	for _, e := range tp.entries {
+		if e.AccessToken != "" && !e.ExpiresAt.IsZero() && now.After(e.ExpiresAt) {
+			expired++
+		}
+	}
+	valid = total - errored - expired
+	if valid < 0 {
+		valid = 0
+	}
+	return
+}
+
 // ErrorTokens 返回失效条目的 dedupKey 列表。
 func (tp *TokenPool) ErrorTokens() []string {
 	tp.mu.Lock()

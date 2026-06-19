@@ -23,13 +23,13 @@ func (c *Client) doJSON(method, path string, headers map[string]string, body []b
 // doJSONCtx 同 doJSON,但支持 context 取消。
 func (c *Client) doJSONCtx(ctx context.Context, method, path string, headers map[string]string, body []byte) (int, []byte, string, error) {
 	fh := c.mergedHeaders(headers)
-	return httpclient.DoJSONCtx(ctx, c.httpClient, method, joinBaseURL(path), c.profileHeaders, fh, body)
+	return httpclient.DoJSONCtx(ctx, c.httpClient, method, joinBaseURL(path), c.fullProfileHeaders(), fh, body)
 }
 
 // doStream 构造请求,执行并返回 fhttp.Response,body 留给调用方流式读取(SSE / 长连接)。
 func (c *Client) doStream(ctx context.Context, method, path string, headers map[string]string, body []byte) (*fhttp.Response, error) {
 	fh := c.mergedHeaders(headers)
-	return httpclient.DoRaw(ctx, c.httpClient, method, joinBaseURL(path), c.profileHeaders, fh, body)
+	return httpclient.DoRaw(ctx, c.httpClient, method, joinBaseURL(path), c.fullProfileHeaders(), fh, body)
 }
 
 // doStreamDefault 使用 background context 的便捷重载。

@@ -30,12 +30,12 @@ func ProxyImageByFileID(
 	apiPath := fmt.Sprintf("https://chatgpt.com/backend-api/files/download/%s?conversation_id=%s&inline=false", fileID, conversationID)
 	_, respBody, _, err := httpclient.DoJSONCtx(ctx, httpClient, fhttp.MethodGet, apiPath,
 		DefaultProfileHeader,
-		fhttp.Header{
+		mergeFilesHeaders(DefaultCommonHeader, fhttp.Header{
 			"Accept":                {"*/*"},
 			"Content-Type":          {"application/json"},
 			"x-openai-target-path":  {apiPath},
 			"x-openai-target-route": {"/backend-api/files/download/{fileId}"},
-		},
+		}),
 		nil,
 	)
 	if err != nil {
@@ -75,7 +75,7 @@ func ProxyImageByFileID(
 		imgClient = cleanClient
 	}
 
-	imgResp, err := httpclient.DoRaw(ctx, imgClient, fhttp.MethodGet, dr.DownloadURL, DefaultProfileHeader, reqHeader, nil)
+	imgResp, err := httpclient.DoRaw(ctx, imgClient, fhttp.MethodGet, dr.DownloadURL, DefaultProfileHeader, mergeFilesHeaders(DefaultCommonHeader, reqHeader), nil)
 	if err != nil {
 		return fmt.Errorf("proxy fetch image failed: %w", err)
 	}
@@ -109,12 +109,12 @@ func ResolveFileDownloadURL(ctx context.Context, httpClient httpclient.HTTPClien
 	apiPath := fmt.Sprintf("https://chatgpt.com/backend-api/files/download/%s?conversation_id=%s&inline=false", fileID, conversationID)
 	_, respBody, _, err := httpclient.DoJSONCtx(ctx, httpClient, fhttp.MethodGet, apiPath,
 		DefaultProfileHeader,
-		fhttp.Header{
+		mergeFilesHeaders(DefaultCommonHeader, fhttp.Header{
 			"Accept":                {"*/*"},
 			"Content-Type":          {"application/json"},
 			"x-openai-target-path":  {apiPath},
 			"x-openai-target-route": {"/backend-api/files/download/{fileId}"},
-		},
+		}),
 		nil,
 	)
 	if err != nil {
@@ -141,7 +141,7 @@ func fetchURLBytes(ctx context.Context, httpClient, cleanClient httpclient.HTTPC
 	} else {
 		imgClient = cleanClient
 	}
-	imgResp, err := httpclient.DoRaw(ctx, imgClient, fhttp.MethodGet, downloadURL, DefaultProfileHeader, reqHeader, nil)
+	imgResp, err := httpclient.DoRaw(ctx, imgClient, fhttp.MethodGet, downloadURL, DefaultProfileHeader, mergeFilesHeaders(DefaultCommonHeader, reqHeader), nil)
 	if err != nil {
 		return nil, "", err
 	}

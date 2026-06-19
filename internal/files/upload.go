@@ -42,8 +42,31 @@ type Logger func(format string, args ...interface{})
 // root 包通过 SetDefaultProfileHeader 注入实际的 profile。
 var DefaultProfileHeader fhttp.Header
 
+// DefaultCommonHeader 是默认的业务 header (Authorization / Origin / Referer / oai-*)。
+// root 包通过 SetDefaultCommonHeader 注入。
+var DefaultCommonHeader fhttp.Header
+
 // SetDefaultProfileHeader 设置默认 profile header (root 包调用)。
 func SetDefaultProfileHeader(h fhttp.Header) { DefaultProfileHeader = h }
+
+// SetDefaultCommonHeader 设置默认 common header (root 包调用)。
+func SetDefaultCommonHeader(h fhttp.Header) { DefaultCommonHeader = h }
+
+// mergeFilesHeaders 合并 common + extra (common 用 Set 覆盖)。
+func mergeFilesHeaders(common, extra fhttp.Header) fhttp.Header {
+	out := fhttp.Header{}
+	for k, vs := range common {
+		for _, v := range vs {
+			out.Set(k, v)
+		}
+	}
+	for k, vs := range extra {
+		for _, v := range vs {
+			out.Set(k, v)
+		}
+	}
+	return out
+}
 
 // UploadedFile 是三步上传后沉淀的"可 attach 给 messages"的元数据。
 type UploadedFile struct {
@@ -166,7 +189,7 @@ func UploadFile(
 	status, respBody, _, err := httpclient.DoJSONCtx(ctx, httpClient,
 		fhttp.MethodPost, "https://chatgpt.com/backend-api/files",
 		DefaultProfileHeader,
-		fhttp.Header{"Content-Type": {"application/json"}},
+		mergeFilesHeaders(DefaultCommonHeader, fhttp.Header{"Content-Type": {"application/json"}}),
 		step1Body,
 	)
 	if err != nil {
@@ -198,7 +221,7 @@ func UploadFile(
 	// azureClient 已是无 auth header 的干净 client。
 	azureResp, err := httpclient.DoRaw(ctx, azureClient, fhttp.MethodPut, step1Resp.UploadURL,
 		nil,
-		fhttp.Header{
+		mergeFilesHeaders(DefaultCommonHeader, fhttp.Header{
 			"Content-Type":  {mime},
 			"x-ms-blob-type": {"BlockBlob"},
 			"x-ms-version":   {"2020-04-08"},
@@ -207,7 +230,7 @@ func UploadFile(
 			"Accept":        {"application/json, text/plain, */*"},
 			"Accept-Language": {"en-US,en;q=0.8"},
 			"Referer":       {"https://chatgpt.com/"},
-		},
+		}),
 		data,
 	)
 	if err != nil {
@@ -225,7 +248,7 @@ func UploadFile(
 		fhttp.MethodPost,
 		"https://chatgpt.com/backend-api/files/"+step1Resp.FileID+"/uploaded",
 		DefaultProfileHeader,
-		fhttp.Header{"Content-Type": {"application/json"}},
+		mergeFilesHeaders(DefaultCommonHeader, fhttp.Header{"Content-Type": {"application/json"}}),
 		[]byte("{}"),
 	)
 	if err != nil {

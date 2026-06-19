@@ -3,7 +3,20 @@ package main
 // Config 客户端配置
 type Config struct {
 	BearerToken  string // 必需：ChatGPT Bearer Token (JWT)
-	CookieString string // 可选：Cookie 字符串
+	CookieString string // 可选：浏览器 Cookie 字符串 (从 DevTools 复制)
+
+	// IsFree free 账号:把 token 放到 oai-device-id 头(不是 Authorization)
+	IsFree bool
+
+	// PUID 可选:Team/付费账号的 _puid cookie 值
+	PUID string
+
+	// TeamAccountID 可选:Team 账号的 Chatgpt-Account-Id header 值
+	TeamAccountID string
+
+	// ExtraHeaders 可选:反爬 header 表
+	ExtraHeaders map[string]string
+
 	Model        string // 可选：默认 "gpt-5-5-thinking"
 	DeviceID     string // 可选：设备 ID，留空自动生成 UUID
 	BuildHash    string // 可选：客户端构建哈希

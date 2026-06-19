@@ -23,6 +23,24 @@ func Truncate(s string, maxLen int) string {
 	return s[:maxLen]
 }
 
+// mergeHeaders 把 commonHeader (Authorization / Origin / Referer 等)
+// 与 extra (业务 / 请求特定) 合并。common 优先(以 Set 覆盖),保证
+// Authorization 等关键 header 不会被业务头意外清空。
+func mergeHeaders(common, extra fhttp.Header) fhttp.Header {
+	out := fhttp.Header{}
+	for k, vs := range common {
+		for _, v := range vs {
+			out.Set(k, v)
+		}
+	}
+	for k, vs := range extra {
+		for _, v := range vs {
+			out.Set(k, v)
+		}
+	}
+	return out
+}
+
 // NewUUID 调用方注入的实现(sentinel.GenerateUUID)。
 type NewUUID func() string
 
@@ -41,7 +59,8 @@ type ClientParams struct {
 	NewUUID       NewUUID
 	NewPOWConfig  POWConfigRequirements
 	SolveProof    POWProof
-	ProfileHeader fhttp.Header // 浏览器指纹 header (UA / sec-ch-ua / accept-encoding 等)
+	ProfileHeader fhttp.Header  // 浏览器指纹 header (UA / sec-ch-ua / accept-encoding 等)
+	CommonHeader  fhttp.Header  // 业务头 (Authorization / Origin / Referer / oai-* 等) — 与 ProfileHeader 合并后发送
 }
 
 // GetConduitToken 获取 conduit_token(Step 1)。
@@ -92,7 +111,7 @@ func GetConduitToken(p ClientParams, model, turnTraceID, partialText string) (st
 		fhttp.MethodPost,
 		p.BaseURL+"/backend-api/f/conversation/prepare",
 		p.ProfileHeader,
-		headers,
+		mergeHeaders(p.CommonHeader, headers),
 		bodyBytes,
 	)
 	if err != nil {
@@ -132,12 +151,12 @@ func GetSentinelToken(p ClientParams) (sentinelToken, proofToken string, err err
 		fhttp.MethodPost,
 		p.BaseURL+"/backend-api/sentinel/chat-requirements/prepare",
 		p.ProfileHeader,
-		fhttp.Header{
+		mergeHeaders(p.CommonHeader, fhttp.Header{
 			"Accept":                {"*/*"},
 			"Content-Type":          {"application/json"},
 			"x-openai-target-path":  {"/backend-api/sentinel/chat-requirements/prepare"},
 			"x-openai-target-route": {"/backend-api/sentinel/chat-requirements/prepare"},
-		},
+		}),
 		prepBody,
 	)
 	if err != nil {
@@ -192,12 +211,12 @@ func GetSentinelToken(p ClientParams) (sentinelToken, proofToken string, err err
 		fhttp.MethodPost,
 		p.BaseURL+"/backend-api/sentinel/chat-requirements/finalize",
 		p.ProfileHeader,
-		fhttp.Header{
+		mergeHeaders(p.CommonHeader, fhttp.Header{
 			"Accept":                {"*/*"},
 			"Content-Type":          {"application/json"},
 			"x-openai-target-path":  {"/backend-api/sentinel/chat-requirements/finalize"},
 			"x-openai-target-route": {"/backend-api/sentinel/chat-requirements/finalize"},
-		},
+		}),
 		fb,
 	)
 	if err != nil {
