@@ -7,6 +7,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -56,7 +57,7 @@ func (c *Client) ChatStream(opts ChatOptions, handler StreamHandler) (*ChatResul
 	}
 
 	c.logf("[step 2] 获取 sentinel token...")
-	sentinelToken, proofToken, err := c.getSentinelToken()
+	sentinelToken, proofToken, turnstileToken, err := c.getSentinelToken()
 	if err != nil {
 		return nil, fmt.Errorf("get sentinel token: %w", err)
 	}
@@ -164,7 +165,7 @@ func (c *Client) ChatStream(opts ChatOptions, handler StreamHandler) (*ChatResul
 	}
 	c.logf("[step 3] 发送对话: model=%s, conversation=%s, turn=%d", c.model, convDesc, c.turnCount+1)
 
-	result, err := c.streamConversation(body, opts, sentinelToken, proofToken, conduitToken, turnTraceID, wsConn, handler)
+	result, err := c.streamConversation(body, opts, sentinelToken, proofToken, turnstileToken, conduitToken, turnTraceID, wsConn, handler)
 	if err != nil {
 		return nil, err
 	}
@@ -270,7 +271,7 @@ func nextWsID() int64 {
 }
 
 // streamConversation 发 f/conversation，解析 stream_handoff 后走 WebSocket 续流
-func (c *Client) streamConversation(body interface{}, opts ChatOptions, sentinelToken, proofToken, conduitToken, turnTraceID string, wsConn *websocket.Conn, handler StreamHandler) (*ChatResult, error) {
+func (c *Client) streamConversation(body interface{}, opts ChatOptions, sentinelToken, proofToken, turnstileToken, conduitToken, turnTraceID string, wsConn *websocket.Conn, handler StreamHandler) (*ChatResult, error) {
 	headers := map[string]string{
 		"Accept":       "text/event-stream",
 		"Content-Type": "application/json",
@@ -282,6 +283,9 @@ func (c *Client) streamConversation(body interface{}, opts ChatOptions, sentinel
 	}
 	if proofToken != "" {
 		headers["openai-sentinel-proof-token"] = proofToken
+	}
+	if turnstileToken != "" {
+		headers["openai-sentinel-turnstile-token"] = turnstileToken
 	}
 
 	bodyBytes, err := json.Marshal(body)
@@ -802,6 +806,12 @@ func imageFileIDSeen(ids []string, id string) bool {
 func (c *Client) logAndRecordWSFrames(raw []byte, frames []map[string]interface{}) {
 	rawStr := string(raw)
 	hasImg := strings.Contains(rawStr, "sediment://") || strings.Contains(rawStr, "image_asset_pointer")
+	// DEBUG: 打印 WS 帧前 1500 字节,定位 catchup 嵌套结构
+	preview := rawStr
+	if len(preview) > 1500 {
+		preview = preview[:1500] + "...[truncated " + strconv.Itoa(len(rawStr)-1500) + "B]"
+	}
+	c.logf("[ws-frame-raw] %s", preview)
 	if len(frames) == 0 {
 		c.logf("[ws-frame] (unparsed) raw_len=%d has_image_ref=%v", len(raw), hasImg)
 		if c.StreamRecorder != nil {

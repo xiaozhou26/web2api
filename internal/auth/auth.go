@@ -23,6 +23,14 @@ func Truncate(s string, maxLen int) string {
 	return s[:maxLen]
 }
 
+// previewStr 安全预览字符串 (前 maxLen, 省略中间)。
+func previewStr(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
+}
+
 // mergeHeaders 把 commonHeader (Authorization / Origin / Referer 等)
 // 与 extra (业务 / 请求特定) 合并。common 优先(以 Set 覆盖),保证
 // Authorization 等关键 header 不会被业务头意外清空。
@@ -50,17 +58,22 @@ type POWConfigRequirements func(userAgent string) string
 // POWProof proof token 求解器。
 type POWProof func(seed, difficulty, userAgent string) string
 
+// TurnstileSolver 求解 turnstile challenge(dx → response)。可选;无 solver 时返回空串。
+type TurnstileSolver func(userAgent, dx string) (string, error)
+
 // ClientParams 注入到 GetConduitToken / GetSentinelToken 的依赖。
 type ClientParams struct {
-	HTTPClient    httpclient.HTTPClient
-	BaseURL       string // 例如 "https://chatgpt.com"
-	UserAgent     string
-	Logger        Logger
-	NewUUID       NewUUID
-	NewPOWConfig  POWConfigRequirements
-	SolveProof    POWProof
-	ProfileHeader fhttp.Header  // 浏览器指纹 header (UA / sec-ch-ua / accept-encoding 等)
-	CommonHeader  fhttp.Header  // 业务头 (Authorization / Origin / Referer / oai-* 等) — 与 ProfileHeader 合并后发送
+	HTTPClient       httpclient.HTTPClient
+	BaseURL          string // 例如 "https://chatgpt.com"
+	UserAgent        string
+	Logger           Logger
+	NewUUID          NewUUID
+	NewPOWConfig     POWConfigRequirements
+	SolveProof       POWProof
+	SolveTurnstile   TurnstileSolver // 可选;若 turnstile required 但无 solver,会发送空 token
+	ProfileHeader    fhttp.Header    // 浏览器指纹 header (UA / sec-ch-ua / accept-encoding 等)
+	CommonHeader     fhttp.Header    // 业务头 (Authorization / Origin / Referer / oai-* 等) — 与 ProfileHeader 合并后发送
+	RequirementsToken string         // 准备阶段生成的 RequirementsToken (gAAAAAC<base64>~S),用作 turnstile solver 的 XOR key
 }
 
 // GetConduitToken 获取 conduit_token(Step 1)。
@@ -136,14 +149,17 @@ func GetConduitToken(p ClientParams, model, turnTraceID, partialText string) (st
 }
 
 // GetSentinelToken 获取 sentinel token(Step 2+3:prepare → PoW → finalize)。
-func GetSentinelToken(p ClientParams) (sentinelToken, proofToken string, err error) {
+// turnstile token 由 TurnstileSolver 求解(可选,无 solver 时为空)。
+// 流程:prepare -> 若 PoW required: 本地求解 -> 若 turnstile required: solver 求解
+//       -> finalize {prepare_token, proofofwork, turnstile}
+func GetSentinelToken(p ClientParams) (sentinelToken, proofToken, turnstileToken string, err error) {
 	reqToken := p.NewPOWConfig(p.UserAgent)
 
 	prepBody, err := json.Marshal(map[string]string{
 		"p": reqToken,
 	})
 	if err != nil {
-		return "", "", fmt.Errorf("marshal prepare body: %w", err)
+		return "", "", "", fmt.Errorf("marshal prepare body: %w", err)
 	}
 
 	status, respBody, _, err := httpclient.DoJSONCtx(
@@ -160,10 +176,10 @@ func GetSentinelToken(p ClientParams) (sentinelToken, proofToken string, err err
 		prepBody,
 	)
 	if err != nil {
-		return "", "", fmt.Errorf("sentinel/prepare request: %w", err)
+		return "", "", "", fmt.Errorf("sentinel/prepare request: %w", err)
 	}
 	if status != 200 {
-		return "", "", fmt.Errorf("sentinel/prepare %d: %s", status, Truncate(string(respBody), 200))
+		return "", "", "", fmt.Errorf("sentinel/prepare %d: %s", status, Truncate(string(respBody), 200))
 	}
 
 	var pd struct {
@@ -174,18 +190,22 @@ func GetSentinelToken(p ClientParams) (sentinelToken, proofToken string, err err
 			Difficulty string `json:"difficulty"`
 		} `json:"proofofwork"`
 		Turnstile *struct {
-			Required bool `json:"required"`
+			Required bool   `json:"required"`
+			DX       string `json:"dx"` // challenge string
 		} `json:"turnstile"`
 		PrepareToken string `json:"prepare_token"`
 	}
 	if err := json.Unmarshal(respBody, &pd); err != nil {
-		return "", "", fmt.Errorf("parse sentinel/prepare: %w", err)
+		return "", "", "", fmt.Errorf("parse sentinel/prepare: %w", err)
 	}
 
 	powRequired := pd.Proofofwork != nil && pd.Proofofwork.Required
 	turnstileRequired := pd.Turnstile != nil && pd.Turnstile.Required
 	if p.Logger != nil {
 		p.Logger("  [sentinel] persona=%s, PoW=%v, turnstile=%v", pd.Persona, powRequired, turnstileRequired)
+		if turnstileRequired && pd.Turnstile != nil {
+			p.Logger("  [turnstile] dx 长度: %d, dx 前 40 字符: %s", len(pd.Turnstile.DX), previewStr(pd.Turnstile.DX, 40))
+		}
 	}
 
 	if powRequired {
@@ -198,12 +218,34 @@ func GetSentinelToken(p ClientParams) (sentinelToken, proofToken string, err err
 		}
 	}
 
+	// turnstile token: 若 required + 有 solver 回调则解算,否则留空
+	if turnstileRequired {
+		if p.SolveTurnstile != nil && pd.Turnstile != nil && pd.Turnstile.DX != "" {
+			s0 := time.Now()
+			turnstileToken, err = p.SolveTurnstile(p.UserAgent, pd.Turnstile.DX)
+			if err != nil {
+				if p.Logger != nil {
+					p.Logger("  [turnstile] solver failed: %v", err)
+				}
+				// turnstile 求解失败仍尝试,服务端可能放过
+			} else if p.Logger != nil {
+				p.Logger("  [turnstile] solved in %dms, token 长度: %d", time.Since(s0).Milliseconds(), len(turnstileToken))
+				if turnstileToken == "" {
+					p.Logger("  [turnstile] ⚠️ solver 返回空字符串!可能原因: VM 执行失败 / JSON 解析失败 / key 不对")
+				}
+			}
+		} else if p.Logger != nil {
+			p.Logger("  [turnstile] required but no solver / dx, will send empty turnstile")
+		}
+	}
+
 	fb, err := json.Marshal(map[string]interface{}{
 		"prepare_token": pd.PrepareToken,
 		"proofofwork":   proofToken,
+		"turnstile":     turnstileToken,
 	})
 	if err != nil {
-		return "", "", fmt.Errorf("marshal finalize body: %w", err)
+		return "", "", "", fmt.Errorf("marshal finalize body: %w", err)
 	}
 
 	status, respBody, _, err = httpclient.DoJSONCtx(
@@ -220,10 +262,10 @@ func GetSentinelToken(p ClientParams) (sentinelToken, proofToken string, err err
 		fb,
 	)
 	if err != nil {
-		return "", "", fmt.Errorf("sentinel/finalize request: %w", err)
+		return "", "", "", fmt.Errorf("sentinel/finalize request: %w", err)
 	}
 	if status != 200 {
-		return "", "", fmt.Errorf("sentinel/finalize %d: %s", status, Truncate(string(respBody), 200))
+		return "", "", "", fmt.Errorf("sentinel/finalize %d: %s", status, Truncate(string(respBody), 200))
 	}
 
 	var fd struct {
@@ -231,14 +273,14 @@ func GetSentinelToken(p ClientParams) (sentinelToken, proofToken string, err err
 		ExpireAfter int    `json:"expire_after"`
 	}
 	if err := json.Unmarshal(respBody, &fd); err != nil {
-		return "", "", fmt.Errorf("parse sentinel/finalize: %w", err)
+		return "", "", "", fmt.Errorf("parse sentinel/finalize: %w", err)
 	}
 	if fd.Token == "" {
-		return "", "", fmt.Errorf("no sentinel token: %s", Truncate(string(respBody), 200))
+		return "", "", "", fmt.Errorf("no sentinel token: %s", Truncate(string(respBody), 200))
 	}
 
 	if p.Logger != nil {
 		p.Logger("  [finalize] expire=%ds", fd.ExpireAfter)
 	}
-	return fd.Token, proofToken, nil
+	return fd.Token, proofToken, turnstileToken, nil
 }

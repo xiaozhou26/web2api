@@ -8,8 +8,6 @@ import (
 type (
 	// POWConfig 客户端指纹(由 internal/pow 提供实现)。
 	POWConfig = pow.Config
-	// TurnstileSolver Turnstile challenge solver 接口。
-	TurnstileSolver = pow.TurnstileSolver
 )
 
 // NewPOWConfig 构造随机化的客户端指纹。

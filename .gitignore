@@ -2,8 +2,10 @@
 config.json
 tokens.txt
 tokens.json
+sentinel.config.json
+tools/sentinel.config.json
 testdata/stream-captures/
-
+*.js
 # DALL-E 图片下载目录
 images/
 
@@ -43,4 +45,4 @@ cmd/dll/
 
 # 配置文件 (避免泄露 Token)
 config.json
-gptclient-go/
+client-go/

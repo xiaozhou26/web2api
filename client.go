@@ -21,23 +21,24 @@ const (
 
 // Client 是 ChatGPT 对话客户端,封装了完整的 Sentinel 认证 + SSE 对话流程。
 type Client struct {
-	httpClient     httpclient.HTTPClient
-	cleanClient    httpclient.HTTPClient // 无 auth header 的干净 client,用于外部 CDN
-	profileHeaders fhttp.Header          // chrome profile 头 (UA / sec-ch-ua / accept-encoding)
-	extraHeaders   fhttp.Header          // 用户提供的反爬 header (oai-hlib / oai-sc / oai-gn)
-	isFree         bool                  // free 账号:oai-device-id 替代 Authorization
-	puid           string                // _puid cookie 值 (Team 账号)
-	teamAccountID  string                // Chatgpt-Account-Id header 值 (Team 账号)
-	bearerToken    string
-	cookieStr      string
-	userAgent      string
-	deviceID       string
-	buildHash      string
-	buildNumber    string
-	language       string
-	sessionID      string
-	imageDir       string
-	startTime      time.Time
+	httpClient        httpclient.HTTPClient
+	cleanClient       httpclient.HTTPClient  // 无 auth header 的干净 client,用于外部 CDN
+	profileHeaders    fhttp.Header           // chrome profile 头 (UA / sec-ch-ua / accept-encoding)
+	extraHeaders      fhttp.Header           // 用户提供的反爬 header (oai-hlib / oai-sc / oai-gn)
+	isFree            bool                   // free 账号:oai-device-id 替代 Authorization
+	puid              string                 // _puid cookie 值 (Team 账号)
+	teamAccountID     string                 // Chatgpt-Account-Id header 值 (Team 账号)
+	requirementsToken string                 // 缓存的 RequirementsToken (gAAAAAC<base64>~S),solver 复用
+	bearerToken       string
+	cookieStr         string
+	userAgent         string
+	deviceID          string
+	buildHash         string
+	buildNumber       string
+	language          string
+	sessionID         string
+	imageDir          string
+	startTime         time.Time
 
 	conversationID  string
 	parentMessageID string
@@ -93,9 +94,9 @@ func NewClient(cfg Config) *Client {
 		Logf:            log.Printf,
 	}
 
-	log.Printf("[web2api] [debug] NewClient profileHeaders key count: %d", len(c.profileHeaders))
-	for k, v := range c.profileHeaders {
-		log.Printf("[web2api] [debug] profileHeader[%q] = %v", k, v)
+	// 注入 ExtraHeaders
+	for k, v := range cfg.ExtraHeaders {
+		c.extraHeaders.Set(k, v)
 	}
 
 	// 注入 ExtraHeaders

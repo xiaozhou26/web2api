@@ -1,6 +1,6 @@
 # web2api
 
-> 用 Go 语言逆向实现的 ChatGPT Web 端非官方客户端库，无需 OpenAI API Key，直接使用浏览器 Bearer Token 与 ChatGPT 对话。支持作为 **CLI 工具**或**本地 OpenAI 兼容 API 服务器**使用。
+> 用 Go 逆向实现的 ChatGPT Web 端非官方客户端库（无需 OpenAI API Key），并以 **OpenAI 兼容 API 服务器**形式运行。直接用浏览器 Bearer Token 与 ChatGPT 对话。
 
 ---
 
@@ -8,176 +8,75 @@
 
 - ✅ 完整实现 ChatGPT Web 端 Sentinel 认证流程（conduit token + SHA3-512 PoW + sentinel token）
 - ✅ WebSocket 流式输出（实时回调增量文本，低延迟）
-- ✅ 多轮对话（自动维护 conversation_id / parent_message_id）
-- ✅ DALL-E 图片生成（自动识别生图请求，实时显示思考过程，自动下载到本地）
+- ✅ DALL-E 图片生成（自动识别生图请求、实时下载到本地）
 - ✅ 多模态输入（上传图片到对话）
 - ✅ 文件上传（PDF、文档等）
-- ✅ 临时模式（不保存对话历史 / 不更新记忆）
-- ✅ 浏览器指纹伪装（TLS 指纹 + Edge 146 UA + 完整 sec-ch-ua Headers）
-- ✅ OpenAI 兼容 API 服务器（`/v1/chat/completions`）+ 多 Token 池轮换
-- ✅ 流式产物侧信道（`sentinel`：生图多版本、沙箱文件）— 见 [docs/CLIENT_STREAMING.md](docs/CLIENT_STREAMING.md)
-- ✅ 开箱即用的交互式 CLI（REPL）
+- ✅ 临时模式（不保存对话历史）
+- ✅ 浏览器指纹伪装（**Chrome 148 + Edge UA**，`re-tlsclient` 真实指纹，对齐 wreq 参考实现）
+- ✅ OpenAI 兼容 API 服务器（`/v1/chat/completions` + 多 Token 池轮换 + 401 自动重试）
+- ✅ free 账号模式（`oai-device-id` 替代 Authorization）
+- ✅ Team 账号模式（`Chatgpt-Account-Id` header + `_puid` cookie）
 
 ---
 
-## 项目结构
+## 快速开始
 
-```
-web2api/
-├── types.go            # 公开类型定义（Config、ChatResult、StreamHandler 等）
-├── client.go           # Client 核心结构体 & HTTP 客户端初始化
-├── auth.go             # Sentinel 三步认证（conduit + PoW + sentinel）
-├── pow.go              # SHA3-512 Proof-of-Work 算法实现
-├── chat.go             # 对话主流程（SSE + WebSocket 流式处理）
-├── image.go            # DALL-E 图片轮询、下载、HTTP 代理
-├── files.go            # 文件三步上传（Azure Blob + ChatGPT 注册）
-├── utils.go            # UUID、工具函数
-├── config.json         # 本地凭证配置（不要提交到 Git）
-├── Dockerfile
-├── docker-compose.yml
-└── cmd/
-    ├── chat/main.go    # CLI 交互式 REPL 入口
-    └── server/main.go  # OpenAI 兼容 API 服务器入口
-```
-
----
-
-## 快速开始 — CLI 模式
-
-### 1. 获取 Bearer Token
-
-1. 登录 [https://chatgpt.com](https://chatgpt.com)
-2. 在同一浏览器中打开 [https://chatgpt.com/api/auth/session](https://chatgpt.com/api/auth/session)
-3. 页面会显示一段 JSON，全选（`Ctrl+A`）后复制
-4. 将**完整 JSON** 粘贴到 `config.json` 的 `bearerToken` 字段，程序会自动提取其中的 `accessToken`
-
-```json
-{
-  "bearerToken": "{\"user\":{...},\"accessToken\":\"eyJhbGci...\"}",
-  "cookieString": ""
-}
-```
-
-> 也可以只填纯 JWT 字符串（`eyJhbGci...`），两种格式都支持。
->
-> ⚠️ Token 有效期约 **10 天**，过期后重新打开该页面获取即可。
-
-### 2. 运行
+### 1. 启动服务器
 
 ```bash
-# 交互式多轮对话（REPL 模式）
-go run ./cmd/chat/
+# 默认配置（端口 5005,模型 gpt-5-5-thinking）
+go run .
 
-# 单次问答
-go run ./cmd/chat/ "你好，介绍一下自己"
-
-# 指定模型
-go run ./cmd/chat/ -model gpt-4o-mini "帮我写一段 Go 代码"
-
-# 临时模式（不保存历史）
-go run ./cmd/chat/ -temp
+# 或显式 build
+go build -o web2api.exe .
+./web2api.exe
 ```
 
-### CLI 参数
+服务启动后会监听 `http://0.0.0.0:5005`，对外暴露 OpenAI 兼容接口：
 
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `-config` | `config.json` | 配置文件路径 |
-| `-model` | `gpt-5-5-thinking` | 使用的模型名称 |
-| `-temp` | `false` | 开启临时模式（不保存对话历史） |
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/v1/chat/completions` | OpenAI 兼容聊天接口 |
+| GET | `/v1/models` | 列出可用模型 |
+| POST | `/chat/completions` | 同 `/v1/chat/completions` |
+| GET | `/models` | 同 `/v1/models` |
+| GET | `/health` | 健康检查（含 token 池状态） |
+| GET/POST | `/tokens/*` | Token 池管理 |
 
-### REPL 内置命令
+### 2. Token 管理
 
-| 命令 | 说明 |
-|------|------|
-| `/new` | 开启新对话，清空上下文 |
-| `/model <name>` | 切换模型（不传参数则显示当前模型） |
-| `/temp` | 切换临时模式开/关 |
-| `/info` | 查看当前会话详情（conversation_id、model、轮次等） |
-| `/exit` / `/quit` | 退出程序 |
+服务器支持**两种模式**：
 
-**可选模型参考：**
-
-```
-gpt-5-5-thinking
-gpt-4o
-gpt-4o-mini
-o4-mini-high
-```
-
----
-
-## 快速开始 — API 服务器模式
-
-将 web2api 作为本地 **OpenAI 兼容 API 服务器**运行，可直接接入 Cherry Studio、Open WebUI、NextChat、Cursor 等任意支持自定义 API 地址的客户端。
-
-### 启动服务器
+#### 模式 A：直接 Token 模式（最简）
+不设 `AUTHORIZATION` 环境变量，调用方请求头里的 `Authorization: Bearer <token>` 直接当 ChatGPT token 用。
 
 ```bash
-go run ./cmd/server/
+curl -X POST http://localhost:5005/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <你的 chatgpt.com accessToken>" \
+  -d '{"model":"gpt-5-5-thinking","messages":[{"role":"user","content":"hi"}]}'
 ```
 
-默认监听 `http://localhost:5005`，接口路径：
-- `POST /v1/chat/completions`
-- `GET  /v1/models`
-
-### 配置客户端
-
-在你的 AI 客户端中填写：
-
-| 项目 | 值 |
-|------|----|
-| API Base URL | `http://localhost:5005` |
-| API Key | 留空（或填任意值，视鉴权配置而定） |
-| Model | `gpt-5-5-thinking`（或其他支持的模型） |
-
-### Docker 部署
-
-**直接运行：**
+#### 模式 B：Token 池模式（推荐用于多账号）
+设 `AUTHORIZATION` 环境变量作 API Key，token 走 `tokens.json` 池自动轮换。
 
 ```bash
-docker build -t web2api .
-docker run -d \
-  -p 5005:5005 \
-  -e AUTHORIZATION="your-api-key" \
-  -v $(pwd)/tokens.json:/app/tokens.json \
-  -v $(pwd)/images:/app/images \
-  web2api
+AUTHORIZATION=my-secret-key \
+TOKENS_FILE=tokens.json \
+go run .
 ```
 
-**使用 docker-compose：**
-
-```bash
-# 编辑 docker-compose.yml 中的环境变量后：
-docker compose up -d
-```
-
-### 服务器环境变量
-
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `PORT` | `5005` | 监听端口 |
-| `AUTHORIZATION` | `""` | API 鉴权 Key（留空则不校验，直接用传入 token 作为 ChatGPT token） |
-| `DEFAULT_MODEL` | `gpt-5-5-thinking` | 默认模型 |
-| `TEMP_MODE` | `false` | 临时模式（不保存对话历史） |
-| `IMAGE_DIR` | `images` | 图片保存目录 |
-| `TOKENS_FILE` | `tokens.json` | Token 持久化文件路径（JSON，含 access + session） |
-| `SESSION_TTL_MINUTES` | `120` | Session 不活跃超时（分钟） |
-
-### Token 管理
-
-服务器支持多 Token 轮换，通过管理面板（`http://localhost:5005`）或以下接口管理：
+通过管理接口导入 token：
 
 | 接口 | 说明 |
 |------|------|
 | `GET  /tokens` | 查看 Token 池状态 |
-| `POST /tokens/upload` | 批量上传 Token（JSON body: `{"tokens":"eyJ..."}`) |
+| `POST /tokens/upload` | 批量上传 Token（JSON body: `{"tokens":"eyJ..."}`） |
 | `GET  /tokens/add/:token` | 添加单个 Token |
 | `POST /tokens/clear` | 清空 Token 池 |
 | `GET  /tokens/errors` | 查看失效 Token 列表 |
-| `GET  /health` | 健康检查 |
 
-**`tokens.json` 持久化格式：**
+**`tokens.json` 格式**：
 
 ```json
 {
@@ -194,111 +93,41 @@ docker compose up -d
 }
 ```
 
-**上传/import 支持的文本格式（每行一条，或整段 session JSON）：**
+**Token 格式**（每行或整段）：
+- 仅 Access JWT: `eyJhbGc...`
+- Access + Session: `eyJhbGc...----eyJhbGc...`（四个 `-` 分隔）
+- 仅 Session: `eyJhbGc...` 或 `st:...`
+- 整段 Session JSON: 直接粘贴 `api/auth/session` 返回
 
-| 格式 | 示例 |
-|------|------|
-| 仅 Access | `eyJhbGciOiJS...` |
-| Access + Session | `eyJhbGciOiJS...----eyJhbGciOiJkaXIi...`（四个 `-`） |
-| 仅 Session | `eyJhbGciOiJkaXIi...` 或 `st:...` |
-| Session API JSON | 从 `/api/auth/session` 复制的整段 JSON |
+**`TOKEN_REFRESH_AHEAD_SEC`**（默认 300）控制 AT 过期前多少秒自动用 ST 换新。
 
-首次启动若仅有旧版 `tokens.txt`（按行 `st:` / JWT），会自动迁移到 `tokens.json`。
+### 3. 服务器环境变量
 
-配置 `TOKEN_REFRESH_AHEAD_SEC`（默认 300）可在 AT 过期前提前用 ST 换新；刷新后会写回 JSON。池模式请求若遇 401 会自动尝试刷新一次。
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `PORT` | `5005` | 监听端口 |
+| `AUTHORIZATION` | `""` | API Key；留空则用 direct token 模式 |
+| `DEFAULT_MODEL` | `gpt-5-5-thinking` | 默认模型 |
+| `TEMP_MODE` | `false` | 临时模式（不保存历史） |
+| `IMAGE_DIR` | `images` | 图片保存目录 |
+| `TOKENS_FILE` | `tokens.json` | Token 持久化路径 |
+| `SESSION_TTL_MINUTES` | `120` | Session 不活跃超时 |
+| `BASE_URL` | `""` | 对外地址（生成绝对资源 URL 用） |
+| `TOKEN_REFRESH_AHEAD_SEC` | `300` | AT 提前刷新秒数 |
 
-### 产物检测与流式抓包（stream-capture）
-
-对话结束后是否轮询**图片 / 沙箱文件（pdf、txt 等）**，由 SSE 与对话 JSON 中的**结构化信号**决定（如 `image_gen_task_id`、`author.name=python`、`execution_output`、`/mnt/data/...`），**不使用用户/助手文本关键词**。
-
-抓取三种场景原始流式数据以便分析、调参：
+### 4. Docker 部署
 
 ```bash
-go run ./cmd/stream-capture/ -config config.json
-# 仅跑某一类: -case image | txt | pdf
+docker build -t web2api .
+docker run -d \
+  -p 5005:5005 \
+  -e AUTHORIZATION="your-api-key" \
+  -v $(pwd)/tokens.json:/app/tokens.json \
+  -v $(pwd)/images:/app/images \
+  web2api
 ```
 
-输出目录 `testdata/stream-captures/<时间>-<case>/`：
-
-| 文件 | 内容 |
-|------|------|
-| `sse.ndjson` | 每条 SSE 的 event、data、解析出的 signals |
-| `conversation.json` | 对话 mapping 全量 |
-| `analysis.json` | 信号汇总与 `ArtifactPlan` |
-| `summary.txt` | 人类可读摘要 |
-
-### API 兼容性说明
-
-与标准 OpenAI API 的主要差异：
-
-| 项目 | 说明 |
-|------|------|
-| 多轮对话 | 上下文由服务端 Session 维护，建议每次请求携带响应中返回的 `conversation_id` |
-| `usage` 字段 | 全部为 0（逆向无法统计 token 用量） |
-| `temperature` / `max_tokens` | 接收但不生效 |
-| 图片生成 | 发送生图请求会自动触发 DALL-E，图片以 Markdown 格式 `![](url)` 追加在回复末尾 |
-| `conversation_id`（扩展字段）| 请求中可传入以续接指定会话；响应中会返回，下次携带即可保持上下文 |
-
----
-
-## 作为 Go 库使用
-
-```go
-import "web2api"
-
-client := web2api.NewClient(web2api.Config{
-    BearerToken: "eyJ...",
-    Model:       "gpt-5-5-thinking",
-})
-
-// 非流式（等待完整回复）
-result, err := client.Chat(web2api.ChatOptions{Text: "你好！"})
-fmt.Println(result.Text)
-
-// 流式（实时打印增量）
-result, err := client.ChatStream(web2api.ChatOptions{Text: "讲个故事"}, func(delta string) {
-    fmt.Print(delta)
-})
-
-// 多轮对话（自动衔接，无需手动维护 ID）
-client.Chat(web2api.ChatOptions{Text: "我叫张三"})
-result, _ = client.Chat(web2api.ChatOptions{Text: "我叫什么名字？"}) // → 张三
-
-// 重置会话（开启新对话）
-client.ResetSession()
-
-// 切换模型
-client.SetModel("gpt-4o-mini")
-
-// 禁用自动图片下载（由调用方异步处理）
-client.SetDisableAutoImage(true)
-```
-
-### Config 字段
-
-| 字段 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `BearerToken` | string | ✅ | ChatGPT JWT Token |
-| `CookieString` | string | ❌ | 浏览器 Cookie（可选，增强兼容性） |
-| `Model` | string | ❌ | 模型名，默认 `gpt-5-5-thinking` |
-| `DeviceID` | string | ❌ | 设备 ID，留空自动生成 UUID |
-| `BuildHash` | string | ❌ | 客户端构建 Hash |
-| `BuildNumber` | string | ❌ | 客户端构建号 |
-| `UserAgent` | string | ❌ | User-Agent，默认模拟 Edge 146 |
-| `Language` | string | ❌ | 语言，默认 `zh-CN` |
-| `ImageDir` | string | ❌ | 图片下载目录，默认 `images/` |
-| `TempMode` | bool | ❌ | 临时模式，默认 `false` |
-
-### ChatResult 字段
-
-| 字段 | 说明 |
-|------|------|
-| `Text` | 助手完整回复文本 |
-| `ConversationID` | 对话 ID |
-| `LastAssistantMsgID` | 最后一条助手消息 ID（多轮衔接用） |
-| `ImageTaskID` | DALL-E 图片任务触发标志 |
-| `ImageFileID` | 图片文件 ID（从 WebSocket asset_pointer 直接提取） |
-| `ImagePath` | 已下载图片的本地路径 |
+或 `docker compose up -d`（编辑 `docker-compose.yml` 环境变量）。
 
 ---
 
@@ -308,26 +137,141 @@ client.SetDisableAutoImage(true)
 
 ```
 1. POST /backend-api/f/conversation/prepare
-       → 获取 conduit_token
+       → 获取 conduit_token (header: x-conduit-token: no-token)
 
 2. POST /backend-api/sentinel/chat-requirements/prepare
-       → 获取 PoW 挑战（seed + difficulty）
+       → 获取 PoW 挑战 (seed + difficulty)
+       Header: x-openai-target-path/route
 
-3. 本地 SHA3-512 暴力求解 Proof-of-Work Token
+3. 本地 SHA3-512 暴力求解 PoW
        → RequirementsToken (前缀 gAAAAAC) + ProofToken (前缀 gAAAAAB)
 
 4. POST /backend-api/sentinel/chat-requirements/finalize
        → 获取 sentinel_token
+       Body: {prepare_token, proofofwork}
 
 5. GET  /backend-api/celsius/ws/user
-       → 获取 WebSocket URL，建立持久连接
+       → 获取 WebSocket URL
 
 6. POST /backend-api/f/conversation (SSE)
-       → 初始 SSE 流，获取 stream_handoff / turn_exchange_id
+       Header: Accept: text/event-stream
+              openai-sentinel-chat-requirements-token
+              x-conduit-token
+              x-oai-turn-trace-id
+              x-openai-target-path/route
+       Body: 完整对话 payload
+       → 初始 SSE 流,获取 stream_handoff / turn_exchange_id
 
 7. WebSocket 订阅 conversation-turn-{id}
-       → 接收流式文本 delta（文字回复 / 生图思考过程 / 图片 asset_pointer）
+       Init: connect + subscribe(calpico-chatgpt, conversations, app_notifications)
+       Per-turn: subscribe(conversation-turn-<id>, offset=0)
+       → 接收流式文本 delta（文字 / 生图思考 / 图片 asset_pointer）
 ```
+
+---
+
+## 浏览器指纹
+
+默认使用 **Chrome 148 / Windows TLS 指纹**（`xiaozhou26/re-tlsclient/chrome`），HTTP 头写 **Edge UA + 完整 sec-ch-ua-***（OpenAI 接受这种 Chromium-based 混搭组合）。
+
+**指纹不是 Chrome 单一真实**——是 `Chrome TLS ClientHello + Edge UA` 的混合。这与 `req/v3 ImpersonateChrome()` 行为一致，OpenAI 不会因为 UA 写 Edge 而拦截。
+
+完整 profile header：
+
+```
+User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) ... Chrome/147.0.0.0 ... Edg/147.0.0.0
+sec-ch-ua: "Not)A;Brand";v="8", "Chromium";v="148", "Microsoft Edge";v="148"
+sec-ch-ua-arch: "x86"
+sec-ch-ua-bitness: "64"
+sec-ch-ua-full-version: "148.0.2959.54"
+sec-ch-ua-full-version-list: "Not)A;Brand";v="8.0.0.0", "Chromium";v="148.0.2959.54", "Microsoft Edge";v="148.0.2959.54"
+sec-ch-ua-mobile: ?0
+sec-ch-ua-model: ""
+sec-ch-ua-platform: "Windows"
+sec-ch-ua-platform-version: "19.0.0"
+accept: */*
+accept-encoding: gzip, deflate, br, zstd
+accept-language: zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6
+sec-fetch-dest: empty
+sec-fetch-mode: cors
+sec-fetch-site: same-origin
+priority: u=1, i
+```
+
+**关键约束**：
+
+- TLS ClientHello 与 HTTP header 的 `User-Agent` 都是 Chromium-based（Chrome/Edge 都算）即可
+- Cloudflare / OpenAI 反爬不要求 UA 和 TLS 严格一致
+- 不要设 `accept-encoding` 为空（Cloudflare 拒）
+
+---
+
+## 账号模式
+
+### 普通账号（默认）
+- `Authorization: Bearer <accessToken>` 头随每个请求发出
+- Token 是 chatgpt.com 的 access JWT（不是 platform.openai.com 的 OAuth 客户端 token）
+
+### free 账号
+- Token JWT `aud` 字段以 `["https://api.openai.com/v1"]` 开头的，**是 platform.openai.com 的 OAuth 客户端 token，不是 chatgpt.com 的 access token**
+- 必须在 `Config.IsFree = true` 下，token 才放到 `oai-device-id` 头
+
+### Team 账号
+- 设 `Config.TeamAccountID` → 自动加 `Chatgpt-Account-Id: <id>` 头
+- 设 `Config.PUID` → 自动加 `_puid=<PUID>;` cookie
+
+---
+
+## API 兼容性说明
+
+| 项目 | 说明 |
+|------|------|
+| 多轮对话 | 服务端 Session 维护，响应返回 `conversation_id`（扩展字段），下次携带即可保持上下文 |
+| `usage` 字段 | 全部为 0（逆向无法统计 token 用量） |
+| `temperature` / `max_tokens` | 接收但不生效 |
+| 图片生成 | 发送生图请求自动触发 DALL-E，图片以 Markdown `![](url)` 追加在回复末尾 |
+
+---
+
+## 架构
+
+```
+web2api/
+├── main.go                          # 入口
+├── config.go                        # 环境变量 → ServerConfig
+├── client.go                        # Client 结构体 + 指纹 client 初始化
+├── types.go                         # Config / ChatResult / ChatOptions
+├── utils.go                         # UUID / truncate / previewToken
+├── chat.go                          # Chat/ChatStream + WebSocket 状态机 (1517 行)
+├── facade_*.go                      # *Client 方法薄壳 wrapper
+│   ├── facade_pow.go                # → internal/pow
+│   ├── facade_auth.go               # → internal/auth
+│   ├── facade_stream_artifacts.go   # → internal/{stream,artifacts}
+│   ├── facade_files.go              # → internal/{files,artifacts} + emit* / Finalize* / slot*
+│   └── facade_http.go               # c.doJSON / c.doStream / c.mergedHeaders
+├── handler_*.go                     # HTTP handler (server/)
+├── middleware.go                     # Auth / CORS
+├── openai_types.go                  # OpenAI 兼容类型
+├── router.go                        # gin router
+├── session.go                       # Session 池
+├── token_*.go                       # Token 池 / 刷新
+└── internal/                        # 不导出子包
+    ├── httpclient/                  # HTTP 抽象 (DoJSON/DoRaw/NewRequest)
+    │                                 # 自动解 gzip/deflate/br/zstd
+    ├── pow/                         # SHA3-512 PoW 求解
+    ├── auth/                        # GetConduitToken / GetSentinelToken
+    ├── stream/                      # StreamEvent / StreamRecorder
+    ├── artifacts/                   # ArtifactSignal / SandboxArtifact / Plan
+    └── files/                       # UploadFile / ProxyImage / ProxyPDF
+```
+
+### 关键设计
+
+1. **Client 留根包** — 所有 `*Client` 方法在 facade_*.go，外部调用方零修改
+2. **类型用 type alias** — `StreamEvent = stream.Event`、`ArtifactSignal = artifacts.Signal`
+3. **依赖方向** — `internal/*` 只 import 标准库和第三方包；子包间不互相依赖
+4. **HTTP 抽象** (`internal/httpclient/`) — `HTTPClient = tls_client.HttpClient`
+5. **fingerprint + business header 分离** — `c.fullProfileHeaders()` 是 TLS profile，`c.commonHeaders()` 是业务头（Authorization/Origin/oai-*），两个独立 base + Set 合并
 
 ---
 
@@ -335,25 +279,22 @@ client.SetDisableAutoImage(true)
 
 | 依赖 | 说明 |
 |------|------|
-| [imroc/req/v3](https://github.com/imroc/req) | HTTP 客户端，支持 Chrome TLS 指纹伪装 |
+| [bogdanfinn/tls-client](https://github.com/bogdanfinn/tls-client) | TLS ClientHello 伪装 |
+| [xiaozhou26/re-tlsclient](https://github.com/xiaozhou26/re-tlsclient) | 6 浏览器指纹 profile（chrome/edge/firefox/opera/safari/okhttp） |
+| [bogdanfinn/fhttp](https://github.com/bogdanfinn/fhttp) | fhttp 风格的 HTTP client |
 | [gorilla/websocket](https://github.com/gorilla/websocket) | WebSocket 客户端 |
 | [gin-gonic/gin](https://github.com/gin-gonic/gin) | API 服务器 HTTP 框架 |
 | [golang.org/x/crypto/sha3](https://pkg.go.dev/golang.org/x/crypto/sha3) | SHA3-512（PoW 求解） |
+| [andybalholm/brotli](https://github.com/andybalholm/brotli) | brotli 解压 |
+| [klauspost/compress](https://github.com/klauspost/compress) | zstd 解压 |
 
 ---
 
 ## 注意事项
 
 - 本项目仅供学习与研究使用，请勿用于商业或违反 OpenAI 服务条款的场景
-- Bearer Token 是个人凭证，请勿泄露，**不要将 `config.json` 提交到公开仓库**
-- 建议在 `.gitignore` 中添加以下内容：
-
-```gitignore
-config.json
-tokens.json
-tokens.txt
-images/
-```
+- Bearer Token 是个人凭证，请勿泄露，**不要将 `config.json` / `tokens.json` 提交到公开仓库**
+- `tokens.json` 已在 `.gitignore`
 
 ---
 

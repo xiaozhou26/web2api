@@ -8,9 +8,29 @@ import (
 
 	"web2api/internal/auth"
 	"web2api/internal/httpclient"
+	"web2api/internal/pow"
+	"web2api/internal/turnstile"
 )
 
 // auth facade:根包把 *Client 字段打包成 ClientParams 传给 internal/auth。
+
+// solveTurnstile 调 internal/turnstile.SolveDX 完整模拟 chatgpt turnstile SDK 的 35-opcode VM。
+//
+// 关键: 必须用与 prepare 阶段 *同一个* RequirementsToken 作为 XOR key + window 配置。
+// facade 注入 c.requirementsToken 字段,solver 用它而不是自己重新生成。
+func solveTurnstile(c *Client) auth.TurnstileSolver {
+	return func(userAgent, dx string) (string, error) {
+		rt := c.requirementsToken
+		if rt == "" {
+			rt = pow.NewConfig(userAgent).GenerateRequirementsToken()
+		}
+		token, err := turnstile.SolveDX(rt, dx)
+		if err != nil {
+			return "", err
+		}
+		return token, nil
+	}
+}
 
 func (c *Client) getConduitToken(model, turnTraceID, partialText string) (string, error) {
 	token, err := auth.GetConduitToken(auth.ClientParams{
@@ -106,18 +126,44 @@ func decodeJWTInfo(t string) (header, payload string, exp int64, ok bool) {
 	return string(h), pStr, exp, true
 }
 
-func (c *Client) getSentinelToken() (sentinelToken, proofToken string, err error) {
-	return auth.GetSentinelToken(auth.ClientParams{
-		HTTPClient:    c.httpClient,
-		BaseURL:       "https://chatgpt.com",
-		UserAgent:     c.userAgent,
-		Logger:        c.logf,
-		NewUUID:       GenerateUUID,
-		NewPOWConfig:  powRequirementsToken,
-		SolveProof:    SolveProofToken,
-		ProfileHeader: c.fullProfileHeaders(),
-		CommonHeader:  c.commonHeaders(),
+func (c *Client) getSentinelToken() (sentinelToken, proofToken, turnstileToken string, err error) {
+	// 让 NewPOWConfig 生成的 token 存到 c.requirementsToken (solver 复用同一个)
+	// 注意: 必须 *先* 生成并存, 再调 auth.GetSentinelToken(它内部会再次生成 reqToken)。
+	// 通过 powRequirementsToken 这个 closure 共享状态。
+	c.requirementsToken = NewPOWConfig(c.userAgent).RequirementsToken()
+
+	sentinelToken, proofToken, turnstileToken, err = auth.GetSentinelToken(auth.ClientParams{
+		HTTPClient:     c.httpClient,
+		BaseURL:        "https://chatgpt.com",
+		UserAgent:      c.userAgent,
+		Logger:         c.logf,
+		NewUUID:        GenerateUUID,
+		NewPOWConfig:   powRequirementsTokenFromClient(c),
+		SolveProof:     SolveProofToken,
+		SolveTurnstile: solveTurnstile(c),
+		ProfileHeader:  c.fullProfileHeaders(),
+		CommonHeader:   c.commonHeaders(),
+		RequirementsToken: c.requirementsToken,
 	})
+	if err == nil {
+		c.logf("[sentinel] ✅ token 生成成功")
+		c.logf("[sentinel]   sentinel_token:    %s", previewToken(sentinelToken))
+		c.logf("[sentinel]   proof_token:      %s", previewToken(proofToken))
+		c.logf("[sentinel]   turnstile_token:  %s", previewToken(turnstileToken))
+		c.logf("[sentinel]   sentinel_token 长度: %d 字符", len(sentinelToken))
+		c.logf("[sentinel]   proof_token 长度:   %d 字符", len(proofToken))
+		c.logf("[sentinel]   turnstile_token 长度: %d 字符", len(turnstileToken))
+	}
+	return
+}
+
+// powRequirementsTokenFromClient 返回 closure: 生成 RequirementsToken 并同步存到 c.requirementsToken。
+// auth 包调 NewPOWConfig 时走这个 closure,保证 auth 内部用的 p 字段 = solver 用的 key。
+func powRequirementsTokenFromClient(c *Client) func(string) string {
+	return func(userAgent string) string {
+		c.requirementsToken = NewPOWConfig(userAgent).RequirementsToken()
+		return c.requirementsToken
+	}
 }
 
 // powRequirementsToken 把 pow.Config 适配为 "ua → requirements token string"。

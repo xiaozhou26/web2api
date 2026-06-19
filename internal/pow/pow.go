@@ -1,275 +1,313 @@
-// Package pow 实现 chatgpt.com sentinel 的 PoW 求解逻辑。
+// Package pow 实现 chatgpt.com sentinel 的 PoW 求解 (基于 Python 参考实现)。
 //
-// 两种 PoW token：
+// 三种 sentinel token:
 //
-//  1. RequirementsToken → 客户端主动生成,塞进 /sentinel/chat-requirements
-//     请求体的 `p` 字段。前缀 "gAAAAAC"。固定难度 "0fffff"。
-//     config 是 18 元素数组,迭代 config[3] 与 config[9]。
+//  1. RequirementsToken (gAAAAAC + base64(config) + ~S)
+//     首次 sentinel/chat-requirements 的 p 字段。
+//     config 是 18 元素 config,无 PoW (用 fixedRandom 填 config[3]/[9])。
 //
-//  2. ProofToken         → 服务端返回 `proofofwork.required=true` + seed + difficulty,
-//     客户端本地求解后放进 Header `openai-sentinel-proof-token`。
-//     前缀 "gAAAAAB"。config 是 13 元素数组,只迭代 config[3]。
+//  2. ProofToken (gAAAAAB + base64(config) + ~S)
+//     proofofwork.required=true 时的 p 字段。
+//     config 18 元素,但 config[3]=nonce、config[9]=elapsedMs(整数);
+//     哈希算法 FNV-1a 32-bit,fnv1a(seed + base64(config))[:len(difficulty)] <= difficulty。
 //
-// 两者共享同一个判定函数:SHA3-512(seed + base64(config_json)) 的前 N 字节
-// 按字节序 <= bytes.fromhex(difficulty)。若不满足则 config[3] += 1 重试。
+//  3. SentinelToken (服务端返回的 token, 1500+ 字符 base64)
+//     final / sentinel_token, 由 prepare/finalize 流程产生。
 package pow
 
 import (
-	"bytes"
-	"context"
+	"crypto/rand"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"math/rand"
+	mathrand "math/rand"
 	"strconv"
-	"strings"
-	"sync/atomic"
 	"time"
-
-	"golang.org/x/crypto/sha3"
 )
+
+// mathRandNew 是 math/rand.New 的本地别名 (避免类型混淆)。
+type mathRand = mathrand.Rand
+
+func mathRandNew(seed int64) *mathRand {
+	return mathrand.New(mathrand.NewSource(seed))
+}
 
 const (
-	// 默认 User-Agent:与 sentinel/client.go 中的 defaultUA 保持一致。
-	defaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36 Edg/147.0.0.0"
-
-	prefixRequirements = "gAAAAAC"
-	prefixProof        = "gAAAAAB"
-
-	// requirementsDifficulty 是客户端固定难度。
-	requirementsDifficulty = "0fffff"
-
-	maxRequirementsIter = 500_000
-	maxProofIter        = 100_000
-
-	fallback = "gAAAAABwQ8Lk5FbGpA2NcR9dShT6gYjU7VxZ4D"
+	// PrefixRequirements RequirementsToken 前缀
+	PrefixRequirements = "gAAAAAC"
+	// PrefixProof ProofToken 前缀
+	PrefixProof = "gAAAAAB"
+	// Suffix 附加在 base64(config) 后面的分隔符
+	Suffix = "~S"
 )
 
-var (
-	cores   = []int{16, 24, 32}
-	screens = []int{3000, 4000, 6000}
+// DefaultFlow 是 sentinel prepare/finalize 流程标识。
+const DefaultFlow = "chatgpt"
 
-	navKeys = []string{
-		"webdriver−false", "vendor−Google Inc.", "cookieEnabled−true",
-		"pdfViewerEnabled−true", "hardwareConcurrency−32",
-		"language−zh-CN", "mimeTypes−[object MimeTypeArray]",
-		"userAgentData−[object NavigatorUAData]",
-	}
-	winKeys = []string{
-		"innerWidth", "innerHeight", "devicePixelRatio", "screen",
-		"chrome", "location", "history", "navigator",
-	}
-
-	reactListeners = []string{"_reactListeningcfilawjnerp", "_reactListening9ne2dfo1i47"}
-	proofEvents    = []string{"alert", "ontransitionend", "onprogress"}
-
-	// perfCounter 模拟浏览器 performance.counter() 的单调递增(亚秒级)。
-	perfCounter uint64
-)
-
-// TurnstileSolver 负责把 /sentinel/chat-requirements/prepare 返回的 `turnstile.dx`
-// 挑战字符串,解算成 /sentinel/chat-requirements/finalize 需要的 turnstile
-// response 字符串。
-//
-// 说明:OpenAI 的 turnstile 是基于 Cloudflare turnstile 衍生的自定义 challenge,
-// dx 是混淆 JS + WebAssembly 的输入,response 是执行结果。纯 Go 无法还原,
-// 解算必须委托给外部服务(2captcha/capsolver/自建 headless 浏览器等)。
-//
-// 没有 solver 时,Client 会自动回退到老的单步 chat-requirements 流程
-// (Turnstile=true 直接忽略)。
-type TurnstileSolver interface {
-	Solve(ctx context.Context, dx string) (string, error)
+// NavigatorProps 是 config[10] 候选 — 常见 navigator 原型方法 toString 表征
+var navigatorProps = []string{
+	"clearOriginJoinedAdInterestGroups−function clearOriginJoinedAdInterestGroups() { [native code] }",
+	"canLoadAdAuctionFencedFrame−function canLoadAdAuctionFencedFrame() { [native code] }",
+	"clipboard−[object Clipboard]",
+	"getBattery−function getBattery() { [native code] }",
+	"getGamepads−function getGamepads() { [native code] }",
+	"javaEnabled−function javaEnabled() { [native code] }",
+	"sendBeacon−function sendBeacon() { [native code] }",
+	"vibrate−function vibrate() { [native code] }",
 }
 
-// Config 是 18 元素的客户端指纹数组(requirements_token 用)。
+var windowKeys = []string{
+	"requestIdleCallback", "webkitRequestAnimationFrame", "onfocus", "onblur",
+}
+
+// reactLetters 是 config[11] 随机 suffix 字符表
+var reactLetters = []rune("abcdefghijklmnopqrstuvwxyz0123456789")
+
+// Config 持有 p 字段生成所需的全部上下文 (对齐 Python BrowserSession 字段)。
 type Config struct {
-	userAgent string
-	arr       [18]interface{}
+	DeviceID          string
+	UserAgent         string
+	Language          string
+	Languages         string
+	TimezoneString    string
+	TimezoneLabel     string
+	ScreenWidth       int
+	ScreenHeight      int
+	HardwareConcurrency int
+	SentinelSV        string  // SDK 版本, e.g. "20260423af3c"
+	BuildID           string  // 来自 chatgpt.com 页面的 data-build
+	// 可选:固定 Math.random (用于测试)
+	FixedRandom *float64
 }
 
-// NewConfig 构造一个随机化的客户端指纹,用于 requirements + proof 两种场景。
-// userAgent 为空时使用内置默认。
+// NewConfig 用默认 Windows / zh-CN / Edge UA 配置构造。
+// userAgent 为空时使用 Edge 147 (与 web2api buildProfileHeaders 一致)。
 func NewConfig(userAgent string) *Config {
 	if userAgent == "" {
-		userAgent = defaultUserAgent
+		userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36 Edg/147.0.0.0"
 	}
-	//nolint:gosec // 非加密用途
-	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
-	now := time.Now().UTC()
-	timeStr := now.Format("Mon Jan 02 2006 15:04:05") + " GMT+0000 (UTC)"
-	perf := float64(atomic.AddUint64(&perfCounter, 1)) + rng.Float64()
-
-	c := &Config{userAgent: userAgent}
-	c.arr = [18]interface{}{
-		cores[rng.Intn(len(cores))] + screens[rng.Intn(len(screens))], // 0
-		timeStr,          // 1
-		nil,              // 2
-		rng.Float64(),    // 3 - 迭代会覆盖
-		userAgent,        // 4
-		nil,              // 5
-		"dpl=1440a687921de39ff5ee56b92807faaadce73f13", // 6
-		"en-US",     // 7
-		"en-US,zh-CN", // 8
-		0,           // 9 - 迭代会覆盖
-		navKeys[rng.Intn(len(navKeys))], // 10
-		"location",  // 11
-		winKeys[rng.Intn(len(winKeys))], // 12
-		perf,        // 13
-		randomUUID(rng), // 14
-		"",          // 15
-		8,           // 16
-		now.Unix(),  // 17
+	return &Config{
+		DeviceID:            randomUUID(),
+		UserAgent:           userAgent,
+		Language:            "zh-CN",
+		Languages:           "zh-CN,en,en-GB,en-US",
+		TimezoneString:      "GMT+0800",
+		TimezoneLabel:       "中国标准时间",
+		ScreenWidth:         1920,
+		ScreenHeight:        1080,
+		HardwareConcurrency: 8,
+		SentinelSV:          "20260423af3c",
+		BuildID:             "prod-4987068829830ddc3ae6683bd4e633f61b79dec9",
 	}
-	return c
 }
 
-// RequirementsToken 生成 /sentinel/chat-requirements 的 "p" 字段值。
-// 对齐 gen_image.py.get_requirements_token:固定难度 0fffff,前缀 gAAAAAC。
-func (c *Config) RequirementsToken() string {
-	//nolint:gosec
-	seed := strconv.FormatFloat(rand.Float64(), 'f', -1, 64)
-	b64, ok := c.solveRequirements(seed, requirementsDifficulty)
-	if !ok {
-		return prefixRequirements + fallback +
-			base64.StdEncoding.EncodeToString([]byte(`"` + seed + `"`))
-	}
-	return prefixRequirements + b64
-}
-
-// solveRequirements 高性能迭代:预拼 JSON 的三段字节前缀,只在内循环拼 d1/d2。
-// 严格对齐 gen_image.py._generate_answer。
-func (c *Config) solveRequirements(seed, difficulty string) (string, bool) {
-	target, err := hex.DecodeString(difficulty)
-	if err != nil {
-		return "", false
-	}
-	diffLen := len(difficulty) // 字符数(与 Python 对齐)
-
-	// 预拼 p1/p2/p3。config[3] 和 config[9] 位置留给迭代器。
-	arr := c.arr
-	// p1 = json(arr[:3])[:-1] + ","
-	head, _ := json.Marshal([]interface{}{arr[0], arr[1], arr[2]})
-	p1 := append(head[:len(head)-1:len(head)-1], ',')
-
-	mid, _ := json.Marshal([]interface{}{arr[4], arr[5], arr[6], arr[7], arr[8]})
-	// p2 = "," + json(arr[4:9])[1:-1] + ","
-	p2 := make([]byte, 0, len(mid)+2)
-	p2 = append(p2, ',')
-	p2 = append(p2, mid[1:len(mid)-1]...)
-	p2 = append(p2, ',')
-
-	tail, _ := json.Marshal([]interface{}{
-		arr[10], arr[11], arr[12], arr[13], arr[14], arr[15], arr[16], arr[17],
-	})
-	// p3 = "," + json(arr[10:])[1:]  => "," + "element1,...,elementN]"
-	p3 := make([]byte, 0, len(tail)+1)
-	p3 = append(p3, ',')
-	p3 = append(p3, tail[1:]...)
-
-	hasher := sha3.New512()
-	seedB := []byte(seed)
-	buf := make([]byte, 0, len(p1)+32+len(p2)+16+len(p3))
-	b64buf := make([]byte, base64.StdEncoding.EncodedLen(cap(buf)))
-
-	for i := 0; i < maxRequirementsIter; i++ {
-		d1 := strconv.Itoa(i)
-		d2 := strconv.Itoa(i >> 1)
-
-		buf = buf[:0]
-		buf = append(buf, p1...)
-		buf = append(buf, d1...)
-		buf = append(buf, p2...)
-		buf = append(buf, d2...)
-		buf = append(buf, p3...)
-
-		n := base64.StdEncoding.EncodedLen(len(buf))
-		if cap(b64buf) < n {
-			b64buf = make([]byte, n)
-		}
-		b64buf = b64buf[:n]
-		base64.StdEncoding.Encode(b64buf, buf)
-
-		hasher.Reset()
-		hasher.Write(seedB)
-		hasher.Write(b64buf)
-		sum := hasher.Sum(nil)
-
-		// Python: h[:diff_len] <= target
-		// diff_len 是字符数(6),target 是字节(3)。Python bytes cmp 按短的逐字节比较。
-		// 这里保持等价:取 min(len(target), len(sum)) 字节比较。
-		n2 := diffLen
-		if n2 > len(sum) {
-			n2 = len(sum)
-		}
-		cmpLen := n2
-		if cmpLen > len(target) {
-			cmpLen = len(target)
-		}
-		if bytes.Compare(sum[:cmpLen], target[:cmpLen]) <= 0 {
-			return string(b64buf), true
-		}
-	}
-	return "", false
-}
-
-// SolveProofToken 按服务端挑战求解 proof token(header 用,前缀 gAAAAAB)。
-// 迁移自 gen_image.py.generate_proof_token 的轻量 13 元素 config。
-func SolveProofToken(seed, difficulty, userAgent string) string {
-	if seed == "" || difficulty == "" {
-		return ""
-	}
-	if userAgent == "" {
-		userAgent = defaultUserAgent
-	}
-	//nolint:gosec
-	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
-	screen := screens[rng.Intn(len(screens))] * (1 << rng.Intn(3)) // *1/2/4
-
-	timeStr := time.Now().UTC().Format("Mon, 02 Jan 2006 15:04:05 GMT")
-
-	proofConfig := []interface{}{
-		screen, // 0
-		timeStr,
-		nil,
-		0, // 3 - 迭代
-		userAgent,
-		"https://tcr9i.chat.openai.com/v2/35536E1E-65B4-4D96-9D97-6ADB7EFF8147/api.js",
-		"dpl=1440a687921de39ff5ee56b92807faaadce73f13",
-		"en",
-		"en-US",
-		nil,
-		"plugins−[object PluginArray]",
-		reactListeners[rng.Intn(len(reactListeners))],
-		proofEvents[rng.Intn(len(proofEvents))],
-	}
-
-	diffLen := len(difficulty)
-	hasher := sha3.New512()
-	for i := 0; i < maxProofIter; i++ {
-		proofConfig[3] = i
-		raw, err := json.Marshal(proofConfig)
-		if err != nil {
-			continue
-		}
-		b64 := base64.StdEncoding.EncodeToString(raw)
-		hasher.Reset()
-		hasher.Write([]byte(seed + b64))
-		sum := hasher.Sum(nil)
-		hexStr := hex.EncodeToString(sum)
-		if strings.Compare(hexStr[:diffLen], difficulty) <= 0 {
-			return prefixProof + b64
-		}
-	}
-	return prefixProof + fallback +
-		base64.StdEncoding.EncodeToString([]byte(`"` + seed + `"`))
-}
-
-func randomUUID(rng *rand.Rand) string {
+// randomUUID 生成 v4 UUID (与 crypto/rand 区分)。
+func randomUUID() string {
 	var b [16]byte
-	_, _ = rng.Read(b[:])
+	_, _ = rand.Read(b[:])
 	b[6] = (b[6] & 0x0f) | 0x40
 	b[8] = (b[8] & 0x3f) | 0x80
 	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
 		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
+
+var _ = strconv.Itoa // 防 unused import 警告
+
+// dateToString 模拟 Chrome Date.prototype.toString() 输出。
+func (c *Config) dateToString() string {
+	// 简化: 假设 TimezoneString 已经是 "GMT+0800" / TimezoneLabel 是 "中国标准时间"
+	now := time.Now().UTC()
+	return now.Format("Mon Jan 02 2006 15:04:05 ") + c.TimezoneString + " (" + c.TimezoneLabel + ")"
+}
+
+// EncodeConfig 把 config 数组编码为 base64 字符串 (对齐 Python base64.b64encode(json_str.encode('utf-8'))).
+func EncodeConfig(config []any) string {
+	b, err := json.Marshal(config)
+	if err != nil {
+		return ""
+	}
+	return base64.StdEncoding.EncodeToString(b)
+}
+
+// FNV1aHash FNV-1a 32 位哈希, 返回 8 位 hex (小写)。
+// 对齐 Python fnv1a_hash + _imul。
+func FNV1aHash(text string) string {
+	const (
+		fnvOffset = 2166136261
+		fnvPrime  = 16777619
+	)
+	h := uint32(fnvOffset)
+	for _, ch := range text {
+		h ^= uint32(ch)
+		h = imul32(h, fnvPrime)
+	}
+	h ^= h >> 16
+	h = imul32(h, 2246822507)
+	h ^= h >> 13
+	h = imul32(h, 3266489909)
+	h ^= h >> 16
+	return fmt.Sprintf("%08x", h)
+}
+
+// imul32 模拟 JavaScript Math.imul (32 位整数乘法)。
+func imul32(a, b uint32) uint32 {
+	return (a * b) & 0xFFFFFFFF
+}
+
+// rngFloat 返回 Math.random() (若 FixedRandom 非空则返回 fixed 值)。
+func (c *Config) rngFloat(rng *mathRand) float64 {
+	if c.FixedRandom != nil {
+		return *c.FixedRandom
+	}
+	return rng.Float64()
+}
+
+// buildBaseConfig 返回 18 元素 config (但 [3] / [9] / [13] 是占位, 由调用方设置)。
+func (c *Config) buildBaseConfig(rng *mathRand, attempt *int, elapsedMs *float64) []any {
+	dateStr := c.dateToString()
+
+	nowMs := float64(time.Now().UnixMilli())
+	var perfNow float64
+	if c.FixedRandom != nil {
+		// 固定场景: perfNow 取一个固定值
+		perfNow = 1000.0
+	} else {
+		// 真实场景: perfNow 与 timeOrigin 自洽
+		perfNow = 1000.0 + rng.Float64()*49999
+	}
+	timeOrigin := nowMs - perfNow
+
+	// config[3] / config[9] 填充规则
+	var c3, c9 any
+	if attempt != nil {
+		c3 = *attempt
+	} else {
+		c3 = c.rngFloat(rng)
+	}
+	if elapsedMs != nil {
+		c9 = int(*elapsedMs)
+	} else {
+		c9 = c.rngFloat(rng)
+	}
+
+	// config[11] _reactListening 随机 suffix
+	reactSuffix := make([]rune, 11)
+	for i := range reactSuffix {
+		reactSuffix[i] = reactLetters[rng.Intn(len(reactLetters))]
+	}
+
+	// config[12] window 随机 key
+	windowKey := windowKeys[rng.Intn(len(windowKeys))]
+
+	// config[5] currentScript.src
+	scriptSrc := "https://sentinel.openai.com/sentinel/" + c.SentinelSV + "/sdk.js"
+
+	config := []any{
+		c.ScreenWidth + c.ScreenHeight,  // [0]
+		dateStr,                          // [1] Date.toString()
+		int64(4294967296),                // [2] jsHeapSizeLimit
+		c3,                                // [3] Math.random() / PoW nonce
+		c.UserAgent,                      // [4]
+		scriptSrc,                        // [5]
+		nil,                              // [6] documentElement[data-build] (auth.openai.com 为 null)
+		c.Language,                       // [7]
+		c.Languages,                      // [8]
+		c9,                                // [9] Math.random() / PoW elapsed
+		navigatorProps[rng.Intn(len(navigatorProps))], // [10]
+		"_reactListening" + string(reactSuffix),      // [11]
+		windowKey,                        // [12]
+		perfNow,                          // [13] performance.now()
+		c.DeviceID,                       // [14] sid
+		"",                                // [15] location.search
+		c.HardwareConcurrency,            // [16]
+		timeOrigin,                       // [17] performance.timeOrigin
+		0, 0, 0, 0, 0, 0, 0,             // [18]-[24] 全 0 (其他 navigator 探测)
+	}
+	return config
+}
+
+// GenerateRequirementsToken 生成首次 sentinel/req 的 p 字段值。
+// 不需要 PoW,18 元素 config 用 Math.random() 填 [3]/[9]。
+func (c *Config) GenerateRequirementsToken() string {
+	rng := mathRandNew(time.Now().UnixNano())
+	config := c.buildBaseConfig(rng, nil, nil)
+	return PrefixRequirements + EncodeConfig(config) + Suffix
+}
+
+// SolveProofOfWork 按服务端挑战求解 proof token (gAAAAAB 前缀 + FNV-1a 哈希)。
+func (c *Config) SolveProofOfWork(seed, difficulty string) string {
+	if seed == "" || difficulty == "" {
+		return PrefixProof + Suffix
+	}
+	startTime := time.Now().UnixMilli()
+	rng := mathRandNew(time.Now().UnixNano())
+	diffLen := len(difficulty)
+	const maxIter = 500_000
+
+	for i := 0; i < maxIter; i++ {
+		elapsed := time.Now().UnixMilli() - startTime
+		elapsedF := float64(elapsed)
+		attempt := i
+		config := c.buildBaseConfig(rng, &attempt, &elapsedF)
+		// 同步 perfNow 让 timeOrigin 保持自洽
+		config[13] = config[17].(float64) - float64(startTime) + elapsedF
+		encoded := EncodeConfig(config)
+		hashInput := seed + encoded
+		hashResult := FNV1aHash(hashInput)
+		if hashResult[:diffLen] <= difficulty {
+			return PrefixProof + encoded + Suffix
+		}
+	}
+	// 达到最大次数仍未找到,返回 fallback
+	return PrefixProof + "wQ8Lk5FbGpA2NcR9dShT6gYjU7VxZ4D" + Suffix
+}
+
+// BackwardCompat 旧 API 兼容 (client-go 旧版代码依赖这些)。
+
+// (c *Config).RequirementsToken 兼容 client-go 旧名 (返回 gAAAAAC + base64 + ~S)。
+func (c *Config) RequirementsToken() string {
+	return c.GenerateRequirementsToken()
+}
+
+// SolveProofToken 兼容 client-go 旧名 (接受 userAgent 参数)。
+func SolveProofToken(seed, difficulty, userAgent string) string {
+	c := NewConfig(userAgent)
+	return c.SolveProofOfWork(seed, difficulty)
+}
+
+// BuildSentinelRequestBody 构造 sentinel/req 请求体 (JSON 字符串)。
+func BuildSentinelRequestBody(p, deviceID, flow string) string {
+	if flow == "" {
+		flow = DefaultFlow
+	}
+	body := map[string]string{"p": p, "id": deviceID, "flow": flow}
+	b, _ := json.Marshal(body)
+	return string(b)
+}
+
+// SentinelTokenHeader 是 f/conversation 头里 openai-sentinel-token 的值 (JSON)。
+// 字段含义:
+//   p: prepare 阶段用的 p (config 编码)
+//   t: turnstile token (无则空)
+//   c: sentinel token (服务端返回)
+//   id: deviceID
+//   flow: 流程标识
+type SentinelTokenHeader struct {
+	P    string `json:"p"`
+	T    string `json:"t"`
+	C    string `json:"c"`
+	ID   string `json:"id"`
+	Flow string `json:"flow"`
+}
+
+// BuildSentinelTokenHeader 构造 openai-sentinel-token 请求头值 (JSON 字符串)。
+func BuildSentinelTokenHeader(p, turnstileToken, sentinelToken, deviceID, flow string) string {
+	if flow == "" {
+		flow = DefaultFlow
+	}
+	h := SentinelTokenHeader{P: p, T: turnstileToken, C: sentinelToken, ID: deviceID, Flow: flow}
+	b, _ := json.Marshal(h)
+	return string(b)
+}
+
+var _ = strconv.Itoa // 防止 import 警告 (strconv 用于 ext)
